@@ -192,6 +192,13 @@ async def health():
     count = await db.db["ledger"].count_documents({})
     return {"status": "ok", "service": "token-engine", "mode": TOKEN_MODE, "ledger_size": count}
 
+@app.get("/stats")
+async def stats():
+    """Public platform stats for the Home page."""
+    user_count = await db.db["users"].count_documents({})
+    report_count = await db.db["workorders"].count_documents({})
+    return {"user_count": user_count, "report_count": report_count}
+
 @app.post("/auth/register")
 async def register(user: UserRegistration):
     """Register a new user (Citizen or Collector)."""
