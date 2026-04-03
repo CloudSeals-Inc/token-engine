@@ -202,13 +202,16 @@ async def stats():
 @app.post("/auth/register")
 async def register(user: UserRegistration):
     """Register a new user (Citizen or Collector)."""
+    logger.info("[token-engine] POST /auth/register — phone=%s role=%s", user.phone, user.role)
     existing = await db.db["users"].find_one({"phone": user.phone})
     if existing:
+        logger.warning("[token-engine] Register FAILED — phone=%s already exists", user.phone)
         raise HTTPException(400, "User with this phone number already exists")
     
     user_dict = user.dict()
     user_dict["created_at"] = datetime.now(timezone.utc).isoformat()
     await db.db["users"].insert_one(user_dict)
+    logger.info("[token-engine] Register SUCCESS — phone=%s name=%s", user.phone, user.name)
     
     if "_id" in user_dict:
         del user_dict["_id"]
@@ -217,9 +220,12 @@ async def register(user: UserRegistration):
 @app.post("/auth/login")
 async def login(req: UserLogin):
     """Simple phone-based login for Phase 1."""
+    logger.info("[token-engine] POST /auth/login — phone=%s", req.phone)
     user = await db.db["users"].find_one({"phone": req.phone})
     if not user:
+        logger.warning("[token-engine] Login FAILED — phone=%s not found", req.phone)
         raise HTTPException(404, "User not found. Please register.")
+    logger.info("[token-engine] Login SUCCESS — phone=%s role=%s", req.phone, user.get('role'))
     
     if "_id" in user:
         del user["_id"]
