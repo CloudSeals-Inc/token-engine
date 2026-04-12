@@ -8,6 +8,7 @@ Ledger: Postgres (off-chain Phase 1) → Polygon ERC-1155 (Phase 2)
 import os
 import logging
 import uuid
+import json
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -15,7 +16,7 @@ from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import httpx
-from .database import db, connect_to_mongo, close_mongo_connection
+from .database import db, connect_to_db, close_db_connection
 
 
 logging.basicConfig(level=logging.INFO)
@@ -30,11 +31,11 @@ app.add_middleware(CORSMiddleware, allow_origins=["*", "https://miba-ui-34063521
 
 @app.on_event("startup")
 async def startup_db_client():
-    await connect_to_mongo()
+    await connect_to_db()
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    await close_mongo_connection()
+    await close_db_connection()
 
 
 # ─── Token config ──────────────────────────────────────────────────────────
@@ -67,9 +68,7 @@ SPLIT_PLATFORM  = float(os.getenv("SPLIT_PLATFORM",  "0.25"))
 SPLIT_MUNICIPAL = float(os.getenv("SPLIT_MUNICIPAL", "0.15"))
 
 
-# ─── Database: MongoDB (replacing in-memory Phase 1) ───────────────────────
-# Collections: ledger
-
+# ─── Database: PostgreSQL ──────────────────────────────────────────────────
 
 
 # ─── Schemas ───────────────────────────────────────────────────────────────
@@ -189,47 +188,49 @@ async def issue_on_chain(category_code: str, tokens: float, collector_id: str) -
 
 @app.get("/health")
 async def health():
-    count = await db.db["ledger"].count_documents({})
+    async with db.pool.acquire() as conn:
+        count = await conn.fetchval("SELECT count(*) FROM token_ledger")
     return {"status": "ok", "service": "token-engine", "mode": TOKEN_MODE, "ledger_size": count}
 
 @app.get("/stats")
 async def stats():
     """Public platform stats for the Home page."""
-    user_count = await db.db["users"].count_documents({})
-    report_count = await db.db["workorders"].count_documents({})
+    async with db.pool.acquire() as conn:
+        user_count = await conn.fetchval("SELECT count(*) FROM users")
+        report_count = await conn.fetchval("SELECT count(*) FROM work_orders")
     return {"user_count": user_count, "report_count": report_count}
 
 @app.post("/auth/register")
 async def register(user: UserRegistration):
     """Register a new user (Citizen or Collector)."""
-    logger.info("[token-engine] POST /auth/register — phone=%s role=%s", user.phone, user.role)
-    existing = await db.db["users"].find_one({"phone": user.phone})
-    if existing:
-        logger.warning("[token-engine] Register FAILED — phone=%s already exists", user.phone)
-        raise HTTPException(400, "User with this phone number already exists")
+    logger.info("[token-engine] SQL POST /auth/register — phone=%s role=%s", user.phone, user.role)
     
-    user_dict = user.dict()
-    user_dict["created_at"] = datetime.now(timezone.utc).isoformat()
-    await db.db["users"].insert_one(user_dict)
+    async with db.pool.acquire() as conn:
+        existing = await conn.fetchrow("SELECT * FROM users WHERE phone = $1", user.phone)
+        if existing:
+            logger.warning("[token-engine] Register FAILED — phone=%s already exists", user.phone)
+            raise HTTPException(400, "User with this phone number already exists")
+        
+        await conn.execute(
+            "INSERT INTO users (full_name, phone, email, role, created_at) VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)",
+            user.name, user.phone, user.email, user.role
+        )
+    
     logger.info("[token-engine] Register SUCCESS — phone=%s name=%s", user.phone, user.name)
-    
-    if "_id" in user_dict:
-        del user_dict["_id"]
-    return user_dict
+    return user.dict()
 
 @app.post("/auth/login")
 async def login(req: UserLogin):
     """Simple phone-based login for Phase 1."""
-    logger.info("[token-engine] POST /auth/login — phone=%s", req.phone)
-    user = await db.db["users"].find_one({"phone": req.phone})
-    if not user:
-        logger.warning("[token-engine] Login FAILED — phone=%s not found", req.phone)
-        raise HTTPException(404, "User not found. Please register.")
-    logger.info("[token-engine] Login SUCCESS — phone=%s role=%s", req.phone, user.get('role'))
-    
-    if "_id" in user:
-        del user["_id"]
-    return user
+    logger.info("[token-engine] SQL POST /auth/login — phone=%s", req.phone)
+    async with db.pool.acquire() as conn:
+        user = await conn.fetchrow("SELECT * FROM users WHERE phone = $1", req.phone)
+        if not user:
+            logger.warning("[token-engine] Login FAILED — phone=%s not found", req.phone)
+            raise HTTPException(404, "User not found. Please register.")
+        
+    logger.info("[token-engine] Login SUCCESS — phone=%s role=%s", req.phone, user['role'])
+    return dict(user)
 
 
 
@@ -254,17 +255,25 @@ async def issue_tokens(req: TokenIssuanceRequest):
         "collector_inr": round(result["inr_value"] * SPLIT_COLLECTOR, 2),
         "platform_inr": round(result["inr_value"] * SPLIT_PLATFORM, 2),
         "municipal_inr": round(result["inr_value"] * SPLIT_MUNICIPAL, 2),
-        "formula_breakdown": result["formula_breakdown"],
+        "formula_breakdown": json.dumps(result["formula_breakdown"]),
         "token_mode": TOKEN_MODE,
         "blockchain_tx_hash": tx_hash,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     }
-    await db.db["ledger"].insert_one(record)
 
+    async with db.pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO token_ledger (
+                token_id, work_order_id, collector_id, category_code, tokens_issued, 
+                inr_value, collector_inr, platform_inr, municipal_inr, 
+                formula_breakdown, token_mode, blockchain_tx_hash, timestamp
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, CURRENT_TIMESTAMP)""",
+            record["token_id"], record["work_order_id"], record["collector_id"], record["category_code"],
+            record["tokens_issued"], record["inr_value"], record["collector_inr"], record["platform_inr"],
+            record["municipal_inr"], record["formula_breakdown"], record["token_mode"], record["blockchain_tx_hash"]
+        )
 
-    logger.info("Tokens issued: %s tokens for WO %s collector %s",
-                result["tokens"], req.work_order_id, req.collector_id)
-
+    logger.info("Tokens issued via SQL: %s tokens for WO %s", result["tokens"], req.work_order_id)
     return TokenIssuanceResult(**record)
 
 
@@ -291,9 +300,17 @@ async def issue_bulk(req: BulkTokenRequest):
             "inr_value": result["inr_value"],
             "blockchain_tx_hash": tx_hash,
         }
-        await db.db["ledger"].insert_one({**record, "work_order_id": req.work_order_id, "collector_id": req.collector_id,
-                        "token_mode": TOKEN_MODE, "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "formula_breakdown": result["formula_breakdown"]})
+        
+        async with db.pool.acquire() as conn:
+            await conn.execute(
+                """INSERT INTO token_ledger (
+                    token_id, work_order_id, collector_id, category_code, tokens_issued, 
+                    inr_value, formula_breakdown, token_mode, blockchain_tx_hash, timestamp
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, CURRENT_TIMESTAMP)""",
+                token_id, req.work_order_id, req.collector_id, item["category_code"],
+                result["tokens"], result["inr_value"], json.dumps(result["formula_breakdown"]),
+                TOKEN_MODE, tx_hash
+            )
 
         issued.append(record)
         total_tokens += result["tokens"]
@@ -316,22 +333,31 @@ async def issue_bulk(req: BulkTokenRequest):
 
 @app.get("/tokens/ledger/{collector_id}")
 async def get_ledger(collector_id: str, limit: int = 50):
-    cursor = db.db["ledger"].find({"collector_id": collector_id}).sort("timestamp", -1).limit(limit)
-    records = await cursor.to_list(length=limit)
+    async with db.pool.acquire() as conn:
+        records = await conn.fetch(
+            "SELECT * FROM token_ledger WHERE collector_id = $1 ORDER BY timestamp DESC LIMIT $2",
+            collector_id, limit
+        )
     
     total = sum(r["tokens_issued"] for r in records)
     total_inr = sum(r["inr_value"] for r in records)
     
-    for r in records:
-        if "_id" in r:
-            del r["_id"]
-            
+    # helper to clean records
+    def clean_rec(r):
+        d = dict(r)
+        if isinstance(d.get('token_id'), uuid.UUID): d['token_id'] = str(d['token_id'])
+        if isinstance(d.get('timestamp'), datetime): d['timestamp'] = d['timestamp'].isoformat()
+        if isinstance(d.get('formula_breakdown'), str):
+            try: d['formula_breakdown'] = json.loads(d['formula_breakdown'])
+            except: pass
+        return d
+
     return {
         "collector_id": collector_id,
         "total_tokens": round(total, 4),
         "total_inr_earned": round(total_inr, 2),
         "collector_payout_inr": round(total_inr * SPLIT_COLLECTOR, 2),
-        "records": records,
+        "records": [clean_rec(r) for r in records],
     }
 
 
