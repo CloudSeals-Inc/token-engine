@@ -212,7 +212,7 @@ async def register(user: UserRegistration):
             raise HTTPException(400, "User with this phone number already exists")
         
         await conn.execute(
-            "INSERT INTO users (full_name, phone, email, role, created_at) VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)",
+            "INSERT INTO users (name, phone, email, role, created_at) VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)",
             user.name, user.phone, user.email, user.role
         )
     
